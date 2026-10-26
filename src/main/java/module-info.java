@@ -2,13 +2,13 @@
  * AtlasUI: the JavaFX widget and theming framework that hosts (GitAlpha)
  * consume as a jar.
  * <p>
- * Exported packages, by layer: {@code com.atlasui.type} holds the framework
- * types (the {@code com.atlasui.type.ISerializable} persistence contract, the
+ * Exported packages, by layer: {@code com.atlasui.Type} holds the framework
+ * types (the {@code com.atlasui.Type.ISerializable} persistence contract, the
  * typed color model and the variant enums); {@code com.atlasui.theme} holds the
  * palette model, {@code ThemeManager} and the base {@code ThemeSkin} machinery,
- * with concrete palettes in {@code com.atlasui.theme.themes} and one skin per
- * themed element in {@code com.atlasui.theme.skin}; and
- * {@code com.atlasui.ui.components} holds the A-prefixed JavaFX controls
+ * with concrete palettes in {@code com.atlasui.theme.Themes} and one skin per
+ * themed element in {@code com.atlasui.theme.Skin}; and
+ * {@code com.atlasui.UI.Components} holds the A-prefixed JavaFX controls
  * (buttons, lists, split pane, tab panel, …). The framework never imports host
  * code — host settings reach it through setters and static defaults.
  * <p>
@@ -26,11 +26,11 @@ module com.atlasui
     requires javafx.controls;
     requires javafx.graphics;
 
-    exports com.atlasui.type;
-    exports com.atlasui.theme;
-    exports com.atlasui.theme.skin;
-    exports com.atlasui.theme.themes;
-    exports com.atlasui.ui.components;
+    exports com.atlasui.Type;
+    exports com.atlasui.Theme;
+    exports com.atlasui.Theme.Skin;
+    exports com.atlasui.Theme.Themes;
+    exports com.atlasui.UI.Components;
 
-    opens com.atlasui.ui.components to javafx.graphics;
+    opens com.atlasui.UI.Components to javafx.graphics;
 }
