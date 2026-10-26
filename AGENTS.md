@@ -1,0 +1,3 @@
+# AtlasUI (probe file — safe to delete)
+
+ATLASUI_INSTRUCTIONS_PROBE_RELATIVE_RESOLUTION_OK
