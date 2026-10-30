@@ -19,8 +19,16 @@ import java.util.Map;
  * {@code TabPane} header. A face being dragged by the reorder gesture is
  * brighter still (+18%) and carries a drop shadow, which together with the
  * closed-hand cursor reads as the face being physically lifted over the
- * strip. No focus ring is drawn — tab buttons are
- * navigation controls, not primary actions.
+ * strip. No focus ring is drawn — tab buttons are navigation controls, not
+ * primary actions — so the {@code .a-tab-button:focused} rule re-asserts the
+ * flat, zero-inset background: Modena paints its ring as an extra background
+ * layer, which would otherwise reappear the moment a tab takes focus. Faces
+ * also pack their content to the left — title flush left, close glyph 2 px
+ * to its right — so a face narrower than its maximum width still reads as a
+ * tab rather than a label floating in the middle of the strip. Which side the
+ * glyph lands on is pinned with {@code -fx-content-display: right} because
+ * Modena's {@code .button} default lays the graphic out before its text,
+ * which would place the {@code ×} to the left of the title.
  * <p>
  * The skin has two size variants ({@link ETabButtonVariant}): {@code NORMAL}
  * is the full-size strip (main project tabs), {@code SMALL} shrinks the face
@@ -29,13 +37,12 @@ import java.util.Map;
  * so colors stay in one place and variants can never drift apart in hue.
  * <p>
  * The {@code .a-tab-close} rules style the {@code ×} close
- * {@link com.atlasui.UI.Components.ATabButton} that
- * {@link com.atlasui.UI.Components.ATabWidget} places inside each tab face
- * in modifiable mode: the Modena button chrome (background and border, with
- * their insets) is reset to transparent so it reads as a flat face — muted
- * normally, primary on hover as the affordance cue; the hover rule re-asserts
- * the transparent background so only the label colour changes. Because the
- * close button also carries {@code .a-tab-button}, whose
+ * {@link com.atlasui.UI.Components.ATabButton} that a closable tab face hosts
+ * as its graphic in modifiable mode: the Modena button chrome (background and
+ * border, with their insets) is reset to transparent so it reads as a flat
+ * face — muted normally, primary on hover as the affordance cue; the hover
+ * rule re-asserts the transparent background so only the label colour changes.
+ * Because the close button also carries {@code .a-tab-button}, whose
  * {@code :hover}/{@code :pressed} rules would otherwise out-specify the flat
  * reset, the compound {@code .a-tab-button.a-tab-close} rules at the end
  * re-flatten those states. The {@code ×} glyph inherits the tab face's font
@@ -68,10 +75,19 @@ public final class TabButtonSkin extends ThemeSkin
 	 * hairline, close face normal, close face hover, then muted and hover
 	 * repeated for the compound {@code .a-tab-button.a-tab-close} state rules
 	 * — as consumed by
-	 * {@link #GetColorArguments}. The tab header's horizontal bar is omitted
-	 * by setting {@link javafx.scene.control.ScrollPane.ScrollBarPolicy#NEVER}
-	 * on the pane in {@link com.atlasui.UI.Components.ATabWidget}; this skin
-	 * does not need CSS rules to hide a mounted bar.
+	 * {@link #GetColorArguments}. The {@code :focused} rule carries no colour
+	 * placeholder: it only re-asserts the flat background, because the focus
+	 * ring Modena would draw there is not wanted on a tab. The
+	 * {@code .a-tab-button} rule also pins the face layout: content packed
+	 * left ({@code center-left}) with the hosted {@code ×} graphic set to
+	 * {@code -fx-content-display: right} and a 2 px
+	 * {@code -fx-graphic-text-gap}, so the title sits flush left and the glyph
+	 * trails it; Modena's {@code .button} default draws the graphic first and
+	 * would otherwise put the {@code ×} before the title. The tab header's
+	 * horizontal bar is omitted by setting
+	 * {@link javafx.scene.control.ScrollPane.ScrollBarPolicy#NEVER} on the pane
+	 * in {@link com.atlasui.UI.Components.ATabWidget}; this skin does not need
+	 * CSS rules to hide a mounted bar.
 	 */
 	private static final String CSS_TEMPLATE = """
 			.a-tab-header {
@@ -89,6 +105,13 @@ public final class TabButtonSkin extends ThemeSkin
 			    -fx-padding: @PAD@;
 			    -fx-font-size: @FONT@;
 			    -fx-cursor: hand;
+			    -fx-alignment: center-left;
+			    -fx-content-display: right;
+			    -fx-graphic-text-gap: 2;
+			}
+			.a-tab-button:focused {
+			    -fx-background-insets: 0;
+			    -fx-background-radius: 0;
 			}
 			.a-tab-button:hover {
 			    -fx-background-color: %s;

@@ -4,19 +4,14 @@ import com.atlasui.Theme.ColorPalette;
 import com.atlasui.Theme.IThemeChangeEvent;
 import com.atlasui.Theme.ThemeManager;
 import com.atlasui.Type.ETabButtonVariant;
-import javafx.animation.AnimationTimer;
-import javafx.animation.Interpolator;
-import javafx.animation.KeyFrame;
-import javafx.animation.KeyValue;
-import javafx.animation.Timeline;
-import javafx.css.PseudoClass;
+import com.atlasui.UI.Animation.AAnimationTimer;
+import com.atlasui.UI.Animation.ITimeStepEvent;
 import javafx.geometry.Bounds;
+import javafx.event.EventHandler;
 import javafx.scene.Node;
+import javafx.scene.Scene;
 import javafx.scene.control.Control;
-import javafx.scene.control.Label;
 import javafx.scene.control.ScrollPane;
-import javafx.scene.input.KeyCode;
-import javafx.scene.input.MouseButton;
 import javafx.scene.input.MouseEvent;
 import javafx.scene.input.ScrollEvent;
 import javafx.scene.layout.Background;
@@ -25,10 +20,10 @@ import javafx.scene.layout.HBox;
 import javafx.scene.layout.Priority;
 import javafx.scene.layout.StackPane;
 import javafx.scene.layout.VBox;
-import javafx.util.Duration;
 
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -54,23 +49,39 @@ import java.util.Map;
  * startup through {@link #SetDefaultTabMaxWidth} — the framework itself never
  * reads application settings.
  * <p>
- * Each tab face is a {@link TabButton} — a private {@link HBox} component
- * holding the title {@link Label} and the close {@link ATabButton} — styled
- * entirely by the cascading tab skin through the {@code a-tab-button} /
- * {@code a-tab-close} style classes; the selected and armed states are custom
- * {@code :selected} / {@code :pressed} pseudo-class toggles, and each face is
- * focus-traversable (primary click or Enter/Space activates it). The
- * {@code "+"} affix is the same component without a close button, kept out of
+ * Each tab face is an {@link ATabButton} — a {@link javafx.scene.control.Button}
+ * whose text is the tab title and whose graphic is the {@code ×} close glyph
+ * — styled entirely by the cascading tab skin through the {@code a-tab-button}
+ * / {@code a-tab-close} style classes; selection is a custom {@code :selected}
+ * pseudo-class, the lifted state a custom {@code :dragging} one, and the
+ * pressed state the button's own armed state. Every face is
+ * focus-traversable and activates on primary click, Space or Enter. The
+ * {@code "+"} affix is the same component without a close glyph, kept out of
  * the tab list so it can never be selected or reordered. Reorder is live and
  * cursor-driven (browser-tab style): once a drag passes a small threshold the
  * face lifts above its siblings and follows the pointer while the strip
  * permutes underneath it, the lifted face carries the {@code :dragging}
  * pseudo-class the skin renders as a raised tab, neighbouring faces slide into
- * their new slots, and the parallel content list plus the selected index follow
- * the permutation.
- * An {@link AnimationTimer} drives the follow, so a pointer held near a
+ * their new slots (each face easing its own offset back to zero through
+ * {@link ATabButton#SlideFrom(double)}), and the parallel content list plus
+ * the selected index follow the permutation. That slide state lives on the
+ * face, not here: the strip only hands each neighbour the offset to ease from
+ * and freezes every face's slide before it permutes the row or hands a face to
+ * the drag follow.
+ * An {@link AAnimationTimer} drives the follow, so a pointer held near a
  * viewport edge keeps auto-scrolling the strip and reordering through tabs
- * that are currently scrolled out of view.
+ * that are currently scrolled out of view. The ticker hands the drag a
+ * per-frame delta time in seconds, and the auto-scroll speed is expressed as
+ * pixels per second from it, so the gesture behaves identically at any
+ * display refresh rate. Because a permutation re-parents the pressed face —
+ * which costs that face its JavaFX mouse-event binding for the rest of the
+ * gesture — the pointer position and the release are also read from the scene
+ * while a drag runs ({@link #InstallGestureHandlers()}), so the follow and the
+ * drop keep working after the first reorder; a scene-level move that finds the
+ * primary button already up ends a gesture whose release was never delivered.
+ * The per-face handlers stay the primary path, and the press stays on the face
+ * so a press on the close glyph (which consumes its own events) never arms a
+ * drag.
  * <p>
  * Tab action handlers resolve their index via {@code TabButtons.indexOf} at
  * invocation time rather than capturing the creation index, so closures stay
@@ -81,13 +92,19 @@ import java.util.Map;
  * to all descendants ({@code .a-tab-header}, {@code .a-tab-button},
  * {@code .a-tab-close}, {@code .a-tab-content}), so header strip, tab faces,
  * close buttons and hairline re-bake together on palette switches. Listeners
- * (selection / new-tab request / tab closed) are held as weak references and
- * pruned on broadcast; the widget's own theme registration stays alive as
- * long as the widget is in the scene graph.
+ * (selection / new-tab request / tab closed / tab order changed) are held as
+ * weak references and pruned on broadcast; the widget's own theme registration
+ * stays alive as long as the widget is in the scene graph. Only a drag-reorder
+ * reports an order change. Consumers read the current order back through
+ * {@link #GetTabContents()} and {@link #GetTabHeaders()}, which both return
+ * index-aligned copies — re-read them after any reorder or close rather than
+ * caching them.
  */
 public class ATabWidget extends VBox implements IThemeChangeEvent
 {
-	/** Pixels the pointer must travel before a press becomes a drag-reorder */
+	/**
+	 * Pixels the pointer must travel before a press becomes a drag-reorder
+	 */
 	private static final double DRAG_THRESHOLD = 6;
 
 	/**
@@ -98,20 +115,29 @@ public class ATabWidget extends VBox implements IThemeChangeEvent
 	 */
 	private static final double AUTO_SCROLL_EDGE_PX = 40;
 
-	/** Auto-scroll speed (pixels per frame) reached at the very edge of the viewport */
+	/**
+	 * Auto-scroll speed reached at the very edge of the viewport, tuned as
+	 * pixels per frame at {@link #AUTO_SCROLL_REFERENCE_FPS} — so the per-second
+	 * speed is this value times that reference rate. Tuning in per-frame units
+	 * keeps the number readable, while scaling it by the frame's delta time makes
+	 * the strip travel at the same visual speed on a 60 Hz and a 120 Hz display.
+	 */
 	private static final double AUTO_SCROLL_MAX_PX = 14;
 
-	/** Duration of the slide animation that moves a face into its new slot */
-	private static final Duration SLOT_SLIDE_DURATION = Duration.millis(130);
-
-	/** Duration of the eased snap-back of a released face into its slot */
-	private static final Duration SNAP_BACK_DURATION = Duration.millis(140);
+	/**
+	 * Refresh rate (frames per second) that {@link #AUTO_SCROLL_MAX_PX} was
+	 * tuned at: the per-frame figure only becomes a time-based speed when
+	 * multiplied by this, and the product is then scaled by the actual frame
+	 * delta. Changing the display's refresh rate therefore changes only how
+	 * finely the scroll is stepped, never how fast the strip travels.
+	 */
+	private static final double AUTO_SCROLL_REFERENCE_FPS = 60;
 
 	/**
 	 * Maximum face height (pixels) for the {@link ETabButtonVariant#SMALL}
 	 * variant; matches the CSS-computed content height of a SMALL tab button
-	 * (label + compact padding) so the header strip is visibly shorter than
-	 * the NORMAL main-tab strip.
+	 * (title, close glyph and compact padding) so the header strip is visibly
+	 * shorter than the NORMAL main-tab strip.
 	 */
 	private static final double TAB_FACE_SMALL_MAX_HEIGHT = 26;
 
@@ -150,13 +176,21 @@ public class ATabWidget extends VBox implements IThemeChangeEvent
 	 * scroll is always disabled.
 	 */
 	private final ScrollPane HeaderScrollPane;
-	/** The inner header row holding only the tab faces (no affix) */
+	/**
+	 * The inner header row holding only the tab faces (no affix)
+	 */
 	private final HBox Header;
-	/** The content stack: whichever child was last set via setAll is visible */
+	/**
+	 * The content stack: whichever child was last set via setAll is visible
+	 */
 	private final StackPane Content;
-	/** All tab faces, in current display order */
-	private final List<TabButton> TabButtons;
-	/** All content nodes, parallel to TabButtons */
+	/**
+	 * All tab faces, in current display order
+	 */
+	private final List<ATabButton> TabButtons;
+	/**
+	 * All content nodes, parallel to TabButtons
+	 */
 	private final List<Node> TabContents;
 	/**
 	 * Whether the user may add, close and reorder tabs (programmatic
@@ -176,12 +210,18 @@ public class ATabWidget extends VBox implements IThemeChangeEvent
 	 * reordering and close logic never see it — its click only fires
 	 * {@link INewTabRequestEvent}s.
 	 */
-	private final TabButton btn_AddTab;
-	/** Configured minimum width for every tab face (default {@link Control#USE_COMPUTED_SIZE}) */
+	private final ATabButton btn_AddTab;
+	/**
+	 * Configured minimum width for every tab face (default {@link Control#USE_COMPUTED_SIZE})
+	 */
 	private double TabMinWidth = Control.USE_COMPUTED_SIZE;
-	/** Configured maximum width for every tab face (constructor baseline {@link #TAB_FACE_MAX_WIDTH_DEFAULT}, or the host's {@link #SetDefaultTabMaxWidth}; {@link Control#USE_COMPUTED_SIZE} once reverted) */
+	/**
+	 * Configured maximum width for every tab face (constructor baseline {@link #TAB_FACE_MAX_WIDTH_DEFAULT}, or the host's {@link #SetDefaultTabMaxWidth}; {@link Control#USE_COMPUTED_SIZE} once reverted)
+	 */
 	private double TabMaxWidth = Control.USE_COMPUTED_SIZE;
-	/** Configured preferred width for every tab face (default {@link Control#USE_COMPUTED_SIZE}) */
+	/**
+	 * Configured preferred width for every tab face (default {@link Control#USE_COMPUTED_SIZE})
+	 */
 	private double TabPrefWidth = Control.USE_COMPUTED_SIZE;
 	/**
 	 * Scene X of the press that may become a drag-reorder: the origin of the
@@ -194,32 +234,77 @@ public class ATabWidget extends VBox implements IThemeChangeEvent
 	 * so a diagonal drag arms the gesture as well.
 	 */
 	private double DragStartY;
-	/** True once the active drag passed {@link #DRAG_THRESHOLD} */
+	/**
+	 * True once the active drag passed {@link #DRAG_THRESHOLD}
+	 */
 	private boolean DragActive;
-	/** The face currently being dragged, or null when no gesture is running */
-	private TabButton DraggedFace;
-	/** Latest pointer X (scene coordinates) while a drag is in progress */
+	/**
+	 * The face currently being dragged, or null when no gesture is running
+	 */
+	private ATabButton DraggedFace;
+	/**
+	 * Latest pointer X (scene coordinates) while a drag is in progress,
+	 * written by the face's own drag handler and — once a reorder has
+	 * re-parented the face — by the scene-level fallback, so the ticker always
+	 * follows the most recent pointer position.
+	 */
 	private double DragPointerSceneX;
-	/** Pointer distance (px) from the dragged face's left edge at grab time */
+	/**
+	 * Pointer distance (px) from the dragged face's left edge at grab time
+	 */
 	private double DragGrabOffsetX;
 	/**
-	 * Per-frame drag driver: keeps the lifted face glued to the pointer,
-	 * auto-scrolls the strip near the viewport edges and re-runs the insertion
-	 * hit test. Started by {@link #BeginDrag}, stopped by {@link #EndDrag}.
+	 * Scene that carries the gesture-level fallback handlers while a drag is
+	 * active; null when no gesture is running. Needed because the pressed
+	 * face stops receiving mouse events the moment {@link #MoveTab} removes
+	 * and re-adds it, so the scene is the only place the rest of the gesture
+	 * can be observed from.
 	 */
-	private final AnimationTimer DragTicker;
-	/** In-flight neighbour slide animation; restarted on every permutation */
-	private Timeline SlideTimeline;
-	/** In-flight snap-back animation of the released face (null when idle) */
-	private Timeline SnapBackTimeline;
-	/** The currently selected tab index, or -1 if nothing is selected */
+	private Scene GestureScene;
+	/**
+	 * Handler subscribed to {@link #GestureScene} for the duration of a
+	 * gesture; null when not installed. Held in a field because the same
+	 * instance has to be handed back to {@code removeEventFilter}.
+	 */
+	private EventHandler<MouseEvent> GestureHandler;
+	/**
+	 * Per-frame drag driver ({@link AAnimationTimer}): keeps the lifted face
+	 * glued to the pointer, auto-scrolls the strip near the viewport edges and
+	 * re-runs the insertion hit test, each frame passing the measured delta
+	 * time in seconds so time-based motion stays refresh-rate independent.
+	 * Started by {@link #BeginDrag}; stopped by {@link #EndDrag},
+	 * {@link #CancelDrag} and {@link #TickDrag(double)} once the gesture is
+	 * over.
+	 */
+	private final AAnimationTimer DragTicker;
+	/**
+	 * Strong reference to the listener {@link #DragTicker} fires every frame,
+	 * subscribed once in the constructor and kept for the widget's lifetime.
+	 * The timer holds its listeners weakly, so the handler must stay reachable
+	 * from this widget or it could be collected between frames and the drag
+	 * follow would stall.
+	 */
+	private final ITimeStepEvent DragStepListener;
+	/**
+	 * The currently selected tab index, or -1 if nothing is selected
+	 */
 	private int SelectedIndex = -1;
-	/** Selection listeners (WeakReference, pruned on broadcast) */
+	/**
+	 * Selection listeners (WeakReference, pruned on broadcast)
+	 */
 	private final List<WeakReference<ISubTabSelectionEvent>> SelectionListeners;
-	/** New-tab-request listeners (WeakReference, pruned on broadcast) */
+	/**
+	 * New-tab-request listeners (WeakReference, pruned on broadcast)
+	 */
 	private final List<WeakReference<INewTabRequestEvent>> NewTabRequestListeners;
-	/** Tab-closed listeners (WeakReference, pruned on broadcast) */
+	/**
+	 * Tab-closed listeners (WeakReference, pruned on broadcast)
+	 */
 	private final List<WeakReference<ITabCloseEvent>> TabCloseListeners;
+	/**
+	 * Tab-order-changed listeners (WeakReference, pruned on broadcast)
+	 */
+	private final List<WeakReference<ITabOrderChangeEvent>> OrderChangeListeners;
 
 	/**
 	 * Create a modifiable or fixed tab widget with the {@code NORMAL} skin
@@ -254,6 +339,7 @@ public class ATabWidget extends VBox implements IThemeChangeEvent
 		SelectionListeners = new ArrayList<>();
 		NewTabRequestListeners = new ArrayList<>();
 		TabCloseListeners = new ArrayList<>();
+		OrderChangeListeners = new ArrayList<>();
 
 		// Inner header: holds only the tab faces (no affix). Sits inside the
 		// scroll pane, which clips and scrolls it when faces overflow.
@@ -292,7 +378,7 @@ public class ATabWidget extends VBox implements IThemeChangeEvent
 
 		if (_Modifiable)
 		{
-			btn_AddTab = new TabButton("+", false);
+			btn_AddTab = new ATabButton("+");
 			btn_AddTab.SetOnAction(this::FireNewTabRequest);
 			HeaderBar.getChildren().add(btn_AddTab);
 		}
@@ -321,15 +407,14 @@ public class ATabWidget extends VBox implements IThemeChangeEvent
 		// per-frame driver is required (instead of reacting to mouse events
 		// only) because the pointer can stand still near a viewport edge while
 		// the strip must keep scrolling and the tab must keep crossing the
-		// faces that scroll past it.
-		DragTicker = new AnimationTimer()
-		{
-			@Override
-			public void handle(long _Now)
-			{
-				TickDrag();
-			}
-		};
+		// faces that scroll past it. AAnimationTimer hands TickDrag the elapsed
+		// seconds of the frame, so the auto-scroll speed does not depend on the
+		// display refresh rate. A timer only re-baselines on its first frame
+		// after start(), which is why BeginDrag positions the face itself
+		// instead of waiting for the first tick.
+		DragTicker = new AAnimationTimer();
+		DragStepListener = this::TickDrag;
+		DragTicker.AddITimeStepEvent(DragStepListener);
 
 		// Weak-reference registration: cleanup is automatic when the widget leaves the scene graph
 		ThemeManager.Instance.AddIThemeChangeEvent(this);
@@ -381,7 +466,7 @@ public class ATabWidget extends VBox implements IThemeChangeEvent
 	public int AddTab(String _Title, Node _Content)
 	{
 		int __Index = TabButtons.size();
-		TabButton __Button = CreateTabButton(_Title);
+		ATabButton __Button = CreateTabButton(_Title);
 		TabButtons.add(__Button);
 		TabContents.add(_Content);
 		Header.getChildren().add(__Button);
@@ -402,16 +487,24 @@ public class ATabWidget extends VBox implements IThemeChangeEvent
 	 * @param _Title the tab label
 	 * @return the wired face (not yet inserted anywhere)
 	 */
-	private TabButton CreateTabButton(String _Title)
+	private ATabButton CreateTabButton(String _Title)
 	{
-		TabButton __Button = new TabButton(_Title, Modifiable);
-		__Button.SetOnAction(() -> SelectTab(TabButtons.indexOf(__Button)));
+		ATabButton __Button = new ATabButton(_Title, Modifiable);
+		// The face can still fire after its tab was closed programmatically
+		// (a release already queued), so resolve the index defensively rather
+		// than passing -1 into SelectTab.
+		__Button.SetOnAction(() ->
+		{
+			int __I = TabButtons.indexOf(__Button);
+			if (__I >= 0)
+				SelectTab(__I);
+		});
 		ApplyTabSizes(__Button);
 
 		// SMALL variant: cap each tab face's height so the compact strip is
 		// visibly shorter than the NORMAL main-tab strip.
 		if (TabVariant == ETabButtonVariant.SMALL)
-			__Button.SetMaxFaceHeight(TAB_FACE_SMALL_MAX_HEIGHT);
+			__Button.setMaxHeight(TAB_FACE_SMALL_MAX_HEIGHT);
 
 		if (!Modifiable)
 			return __Button;
@@ -431,15 +524,22 @@ public class ATabWidget extends VBox implements IThemeChangeEvent
 	 * Attach press/drag/release handlers that implement cursor-following live
 	 * reorder. A press only records the origin; once the pointer travels
 	 * {@link #DRAG_THRESHOLD} pixels (in any direction, so diagonal drags arm
-	 * too) the face lifts and the gesture is handed to {@link #TickDrag()},
+	 * too) the face lifts and the gesture is handed to {@link #TickDrag(double)},
 	 * which re-glues the face to the cursor, auto-scrolls the strip and
 	 * re-runs the hit test every frame. Drag events are consumed to prevent
 	 * the enclosing {@link ScrollPane} from scrolling while a reorder gesture
 	 * is in progress.
+	 * <p>
+	 * These handlers are only the start of the gesture. {@link #MoveTab}
+	 * re-parents the face on the first reorder, after which JavaFX delivers it
+	 * no further mouse events, so the follow and the release continue through
+	 * the scene-level fallback installed by {@link #BeginDrag}. The press
+	 * handler stays on the face on purpose: the close glyph consumes its own
+	 * events, so a press there must never arm a drag.
 	 *
 	 * @param _Button the tab face to make draggable
 	 */
-	private void InstallDragHandlers(TabButton _Button)
+	private void InstallDragHandlers(ATabButton _Button)
 	{
 		_Button.setOnMousePressed(__Event ->
 		{
@@ -473,43 +573,26 @@ public class ATabWidget extends VBox implements IThemeChangeEvent
 	}
 
 	/**
-	 * Lift the given face into a drag: freeze any snap-back still running,
+	 * Lift the given face into a drag: stop any slide still running on it,
 	 * remember the grab offset (measured from the press point, so the face
 	 * does not jump when the threshold is crossed), raise it above its
-	 * siblings and start the per-frame ticker.
+	 * siblings, start the per-frame ticker and install the scene-level gesture
+	 * fallback ({@link #InstallGestureHandlers()}) that carries the gesture
+	 * once a reorder re-parents the face.
 	 *
 	 * @param _Face the face the press started on
 	 */
-	private void BeginDrag(TabButton _Face)
+	private void BeginDrag(ATabButton _Face)
 	{
 		DragActive = true;
 		DraggedFace = _Face;
 		DragGrabOffsetX = DragStartX - _Face.localToScene(0, 0).getX();
 
-		// A snap-back from an earlier release would fight the follow.
-		if (SnapBackTimeline != null)
-		{
-			SnapBackTimeline.stop();
-			SnapBackTimeline = null;
-		}
-
-		// Likewise an in-flight slot slide that still targets this face's
-		// translateX: stop it and re-base it on the faces that are not being
-		// lifted, so their motion stays continuous while this one is claimed
-		// by the drag follow.
-		if (SlideTimeline != null)
-		{
-			SlideTimeline.stop();
-			SlideTimeline = null;
-			Map<TabButton, Double> __Offsets = new HashMap<>();
-			for (TabButton __Other : TabButtons)
-			{
-				if (__Other == _Face || Math.abs(__Other.getTranslateX()) < 0.5)
-					continue;
-				__Offsets.put(__Other, __Other.getTranslateX());
-			}
-			AnimateSlots(__Offsets);
-		}
+		// A slide from an earlier release — or from a permutation that has
+		// just moved this face — writes the same translateX the follow is
+		// about to own: freeze it (leaving the current offset in place, so the
+		// face is not repositioned) and let ApplyDragPosition take over.
+		_Face.StopSlide();
 
 		_Face.SetDragging(true);
 		// viewOrder raises the lifted face without reordering the children
@@ -518,17 +601,117 @@ public class ATabWidget extends VBox implements IThemeChangeEvent
 
 		ApplyDragPosition();
 		DragTicker.start();
+		InstallGestureHandlers();
 	}
 
 	/**
-	 * Per-frame drag driver ({@link AnimationTimer}): auto-scrolls the strip
-	 * when the pointer nears a viewport edge, re-glues the lifted face to the
-	 * cursor (scrolling and permutations move its slot, so the translate must
-	 * be recomputed every frame) and re-runs the insertion hit test. Stops
-	 * itself when the drag ends or when the dragged face is gone (tab closed
-	 * programmatically mid-gesture).
+	 * Subscribe the gesture-level fallback handlers on the scene for the
+	 * duration of a drag.
+	 * <p>
+	 * This exists because of how JavaFX delivers a drag: {@code MOUSE_DRAGGED}
+	 * and {@code MOUSE_RELEASED} are sent to the node that was pressed, and
+	 * that binding is dropped for good when the node leaves the scene graph.
+	 * {@link #MoveTab} re-parents the dragged face every time the order
+	 * changes ({@code remove} + {@code add} on the header), after which the
+	 * face itself receives no further mouse events — its
+	 * {@code setOnMouseDragged} stops updating the pointer and its
+	 * {@code setOnMouseReleased} never fires, leaving the ticker chasing a
+	 * frozen pointer with {@code DragActive} stuck on. The scene keeps
+	 * receiving the same events, so the gesture continues from there.
+	 * <p>
+	 * Installed per gesture rather than once, so an idle widget subscribes to
+	 * nothing.
 	 */
-	private void TickDrag()
+	private void InstallGestureHandlers()
+	{
+		if (GestureScene != null)
+			return;
+		GestureScene = getScene();
+		if (GestureScene == null)
+			return;
+		GestureHandler = this::OnSceneGesture;
+		GestureScene.addEventFilter(MouseEvent.MOUSE_DRAGGED, GestureHandler);
+		GestureScene.addEventFilter(MouseEvent.MOUSE_RELEASED, GestureHandler);
+		// Also watch plain moves: if the button came up somewhere we never saw
+		// the release for (pointer left the window, gesture cancelled by the
+		// OS), a later move over the window is the only signal that the drag is
+		// over.
+		GestureScene.addEventFilter(MouseEvent.MOUSE_MOVED, GestureHandler);
+	}
+
+	/**
+	 * Unsubscribe the gesture-level fallback handlers installed by
+	 * {@link #InstallGestureHandlers()}. No-op when no gesture is running, so
+	 * the end paths call it unconditionally — {@link #EndDrag} and
+	 * {@link #CancelDrag} both invoke it before touching any drag state, which
+	 * is what makes them safe to reach from a stale or already-ended gesture.
+	 */
+	private void RemoveGestureHandlers()
+	{
+		if (GestureScene == null)
+			return;
+		GestureScene.removeEventFilter(MouseEvent.MOUSE_DRAGGED, GestureHandler);
+		GestureScene.removeEventFilter(MouseEvent.MOUSE_RELEASED, GestureHandler);
+		GestureScene.removeEventFilter(MouseEvent.MOUSE_MOVED, GestureHandler);
+		GestureScene = null;
+		GestureHandler = null;
+	}
+
+	/**
+	 * Scene-level continuation of the reorder gesture, installed as a filter on
+	 * the scene so it runs before target handlers and therefore also sees the
+	 * events a face consumes: it feeds the ticker the pointer X the pressed
+	 * face can no longer report, ends the gesture on a release, and ends it on
+	 * the first move whose primary button is already up (a release lost when
+	 * the pointer left the window). Overlapping with the face handlers is
+	 * harmless — both write the same pointer value — and it returns
+	 * immediately once no drag is active.
+	 *
+	 * @param _Event the scene-level mouse event
+	 */
+	private void OnSceneGesture(MouseEvent _Event)
+	{
+		// A gesture can be ended by the event in flight (release) or dropped by
+		// a close; either way nothing more to do for this one.
+		if (!DragActive)
+			return;
+
+		if (_Event.getEventType() == MouseEvent.MOUSE_RELEASED)
+		{
+			DragPointerSceneX = _Event.getSceneX();
+			EndDrag();
+			return;
+		}
+		if (_Event.getEventType() == MouseEvent.MOUSE_DRAGGED)
+		{
+			DragPointerSceneX = _Event.getSceneX();
+			return;
+		}
+		// MOUSE_MOVED: no drag is in progress any more, so the primary button
+		// must be up — a release we never got to see.
+		if (!_Event.isPrimaryButtonDown())
+			EndDrag();
+	}
+
+	/**
+	 * Per-frame drag driver, registered as the {@link #DragTicker} step
+	 * listener in the constructor: auto-scrolls the strip when the pointer nears
+	 * a viewport edge, re-glues the lifted face to the cursor (scrolling and
+	 * permutations move its slot, so the translate must be recomputed every
+	 * frame) and re-runs the insertion hit test, re-gluing once more whenever
+	 * that test permutes the strip. The pointer X it follows is whatever
+	 * {@link #DragPointerSceneX} last recorded — the face's own drag handler
+	 * before a reorder, the scene-level fallback afterwards — so the follow
+	 * keeps tracking the cursor even though the pressed face has stopped
+	 * receiving events. Stops the ticker as soon as it finds no active gesture
+	 * left, and aborts the drag when the dragged face is gone (tab closed
+	 * programmatically mid-gesture).
+	 *
+	 * @param _DeltaTime elapsed seconds since the previous frame, as measured
+	 *                   and clamped by the timer; only the auto-scroll speed
+	 *                   uses it, the follow itself reacts to absolute positions
+	 */
+	private void TickDrag(double _DeltaTime)
 	{
 		if (!DragActive || DraggedFace == null)
 		{
@@ -541,7 +724,7 @@ public class ATabWidget extends VBox implements IThemeChangeEvent
 			return;
 		}
 
-		AutoScrollStrip();
+		AutoScrollStrip(_DeltaTime);
 		ApplyDragPosition();
 
 		int __From = TabButtons.indexOf(DraggedFace);
@@ -575,25 +758,38 @@ public class ATabWidget extends VBox implements IThemeChangeEvent
 	/**
 	 * Scroll the tab strip while the pointer hovers near a viewport edge, so
 	 * tabs that are scrolled out of view stay reachable during a drag. Speed
-	 * scales with the depth into the {@link #AUTO_SCROLL_EDGE_PX} band; the
-	 * pixel delta is converted to a fraction of the scrollable range (content
-	 * width minus viewport width) before adjusting
+	 * scales with the depth into the {@link #AUTO_SCROLL_EDGE_PX} band, topping
+	 * out at {@code AUTO_SCROLL_MAX_PX * AUTO_SCROLL_REFERENCE_FPS} pixels per
+	 * second at the very edge, and is multiplied by the frame's delta time — so
+	 * the visual speed matches on 60 Hz and high-refresh displays while a
+	 * stalled frame stays bounded instead of running away (the timer clamps the
+	 * delta). The pixel delta is converted to a fraction of the scrollable range
+	 * (content width minus viewport width) before adjusting
 	 * {@link ScrollPane#hvalueProperty()}. No-op while the strip fits.
+	 *
+	 * @param _DeltaTime elapsed seconds since the previous frame; scales the
+	 *                   auto-scroll pixel speed, so a doubled frame scrolls
+	 *                   twice as far
 	 */
-	private void AutoScrollStrip()
+	private void AutoScrollStrip(double _DeltaTime)
 	{
 		Bounds __Viewport = HeaderScrollPane.localToScene(HeaderScrollPane.getLayoutBounds());
 		double __Range = Header.getLayoutBounds().getWidth() - HeaderScrollPane.getLayoutBounds().getWidth();
 		if (__Range <= 0)
 			return;
 
+		// Turn the per-reference-frame tuning into a per-second speed and scale
+		// it by this frame's duration: at AUTO_SCROLL_REFERENCE_FPS the product
+		// collapses back to AUTO_SCROLL_MAX_PX pixels, and a slower pulse
+		// scrolls proportionally further instead of crawling.
+		double __MaxPixels = AUTO_SCROLL_MAX_PX * AUTO_SCROLL_REFERENCE_FPS * _DeltaTime;
 		double __Pixels = 0;
 		double __LeftEdge = __Viewport.getMinX() + AUTO_SCROLL_EDGE_PX;
 		double __RightEdge = __Viewport.getMaxX() - AUTO_SCROLL_EDGE_PX;
 		if (DragPointerSceneX < __LeftEdge)
-			__Pixels = -AUTO_SCROLL_MAX_PX * Math.min(1.0, (__LeftEdge - DragPointerSceneX) / AUTO_SCROLL_EDGE_PX);
+			__Pixels = -__MaxPixels * Math.min(1.0, (__LeftEdge - DragPointerSceneX) / AUTO_SCROLL_EDGE_PX);
 		else if (DragPointerSceneX > __RightEdge)
-			__Pixels = AUTO_SCROLL_MAX_PX * Math.min(1.0, (DragPointerSceneX - __RightEdge) / AUTO_SCROLL_EDGE_PX);
+			__Pixels = __MaxPixels * Math.min(1.0, (DragPointerSceneX - __RightEdge) / AUTO_SCROLL_EDGE_PX);
 		if (__Pixels == 0)
 			return;
 
@@ -610,12 +806,21 @@ public class ATabWidget extends VBox implements IThemeChangeEvent
 	}
 
 	/**
-	 * Finish the active drag: stop the ticker, drop the lifted styling and
-	 * ease the face from wherever the cursor left it into its slot. A plain
-	 * click (threshold never crossed) just clears the flags.
+	 * Finish the active drag: drop the scene-level gesture handlers, stop the
+	 * ticker, drop the lifted styling and ease the face from wherever the
+	 * cursor left it into its slot. Reached from the face's own release
+	 * handler, or — once a reorder has cost the face its mouse events — from
+	 * the scene-level release or from the stale-release detection in
+	 * {@link #OnSceneGesture(MouseEvent)}. The handler teardown runs first and
+	 * unconditionally, which makes the call idempotent and also cleans up a
+	 * gesture that was already gone. A plain click (threshold never crossed)
+	 * just clears the flags.
 	 */
 	private void EndDrag()
 	{
+		// Idempotent, and also the cleanup for the stale-gesture path below.
+		RemoveGestureHandlers();
+
 		if (!DragActive || DraggedFace == null)
 		{
 			DragActive = false;
@@ -623,58 +828,65 @@ public class ATabWidget extends VBox implements IThemeChangeEvent
 		}
 
 		DragTicker.stop();
-		TabButton __Face = DraggedFace;
+		ATabButton __Face = DraggedFace;
 		DraggedFace = null;
 		DragActive = false;
+
+		// The lifted *look* ends now, but the lifted z-order does not: the box
+		// shadow comes off immediately while the face still has to glide the
+		// last few pixels home, and dropping viewOrder with it would let the
+		// neighbours — which are sliding at the same time — paint over the face
+		// that was just dropped.
 		ReleaseDragFace(__Face);
-		AnimateSnapBack(__Face);
+		// Ease home from wherever the cursor left it; the z-order only comes
+		// back once the face has landed (the slide reports it, and also does so
+		// when it snaps straight to zero because the leftover offset is
+		// sub-pixel).
+		__Face.SlideFrom(__Face.getTranslateX(), () -> __Face.setViewOrder(0));
+
+		// A reorder is also an activation: the button's own arming may or may
+		// not survive the follow (the face is glued to the cursor, so JavaFX
+		// can disarm it on a lagging frame), so select explicitly instead of
+		// depending on whether ButtonBase fired.
+		int __Index = TabButtons.indexOf(__Face);
+		if (__Index >= 0)
+			SelectTab(__Index);
 	}
 
 	/**
-	 * Abort the active drag without the snap-back animation — used when the
-	 * dragged face disappears (the tab was closed programmatically mid-drag)
-	 * or when a fresh press finds a stale gesture.
+	 * Abort the active drag without the slide: drop the scene-level gesture
+	 * handlers, stop the ticker and reset the face — used when the dragged
+	 * face disappears (the tab was closed programmatically mid-drag) or when a
+	 * fresh press finds a stale gesture left over from a lost release.
 	 */
 	private void CancelDrag()
 	{
+		RemoveGestureHandlers();
 		DragTicker.stop();
 		if (DraggedFace != null)
 		{
+			DraggedFace.StopSlide();
 			DraggedFace.setTranslateX(0);
 			ReleaseDragFace(DraggedFace);
+			// No slide to wait for: the face is simply back in its slot.
+			DraggedFace.setViewOrder(0);
 		}
 		DraggedFace = null;
 		DragActive = false;
 	}
 
 	/**
-	 * Drop the lifted state of a face: clears the {@code :dragging}
-	 * pseudo-class and restores the default draw order.
+	 * Drop the lifted styling of a face: clears the {@code :dragging}
+	 * pseudo-class. The raised z-order is deliberately not touched here — it
+	 * outlives the styling and is handed back by the caller, either
+	 * immediately ({@link #CancelDrag}) or once the face has glided into its
+	 * slot ({@link #EndDrag}).
 	 *
 	 * @param _Face the face leaving the drag
 	 */
-	private void ReleaseDragFace(TabButton _Face)
+	private void ReleaseDragFace(ATabButton _Face)
 	{
 		_Face.SetDragging(false);
-		_Face.setViewOrder(0);
-	}
-
-	/**
-	 * Ease the released face from its last drag position back into the slot
-	 * it was dropped on.
-	 *
-	 * @param _Face the released face
-	 */
-	private void AnimateSnapBack(TabButton _Face)
-	{
-		if (_Face.getTranslateX() == 0)
-			return;
-
-		if (SnapBackTimeline != null)
-			SnapBackTimeline.stop();
-		SnapBackTimeline = new Timeline(new KeyFrame(SNAP_BACK_DURATION,
-				new KeyValue(_Face.translateXProperty(), 0.0, Interpolator.EASE_BOTH)));
-		SnapBackTimeline.playFromStart();
 	}
 
 	/**
@@ -699,7 +911,7 @@ public class ATabWidget extends VBox implements IThemeChangeEvent
 		{
 			if (__I == _From)
 				continue;
-			TabButton __B = TabButtons.get(__I);
+			ATabButton __B = TabButtons.get(__I);
 			double __Mid = __HeaderSceneX + __B.getLayoutX() + __B.getWidth() / 2.0;
 			if (_SceneX > __Mid)
 				__Insert++;
@@ -712,28 +924,29 @@ public class ATabWidget extends VBox implements IThemeChangeEvent
 	 * inner header, the content list follows, and {@code SelectedIndex} is
 	 * remapped with the standard single-element-move shift. Every other face
 	 * keeps the pixel position the eye last saw it at and slides into its new
-	 * slot with a short {@link Timeline}, so a live drag reads as tabs making
-	 * room instead of snapping. The dragged face is skipped — its translate is
-	 * owned by {@link #ApplyDragPosition()}.
+	 * slot through {@link ATabButton#SlideFrom(double)}, so a live drag reads
+	 * as tabs making room instead of snapping. The dragged face is skipped —
+	 * its translate is owned by {@link #ApplyDragPosition()}. The
+	 * {@code remove}/{@code add} pair also costs the dragged face its JavaFX
+	 * mouse-event binding, which is what the scene-level gesture fallback
+	 * installed by {@link #InstallGestureHandlers()} exists to cover.
 	 *
 	 * @param _From source index
 	 * @param _To   target index
 	 */
 	private void MoveTab(int _From, int _To)
 	{
-		// Freeze the visual X of every face before the permutation. A running
-		// slide must stop writing translates first, otherwise the snapshot
-		// would capture a mid-animation value and the restart would jitter.
-		if (SlideTimeline != null)
-		{
-			SlideTimeline.stop();
-			SlideTimeline = null;
-		}
-		Map<TabButton, Double> __VisualX = new HashMap<>();
-		for (TabButton __Face : TabButtons)
+		// Freeze every face's slide before snapshotting: a running slide writes
+		// the same translateX the snapshot reads, and a mid-animation value
+		// would be captured as the "where the eye saw it" origin.
+		for (ATabButton __Face : TabButtons)
+			__Face.StopSlide();
+
+		Map<ATabButton, Double> __VisualX = new HashMap<>();
+		for (ATabButton __Face : TabButtons)
 			__VisualX.put(__Face, __Face.getLayoutX() + __Face.getTranslateX());
 
-		TabButton __Button = TabButtons.remove(_From);
+		ATabButton __Button = TabButtons.remove(_From);
 		Node __MovedContent = TabContents.remove(_From);
 		TabButtons.add(_To, __Button);
 		TabContents.add(_To, __MovedContent);
@@ -750,55 +963,24 @@ public class ATabWidget extends VBox implements IThemeChangeEvent
 			SelectedIndex++;
 
 		// Lay the header out now rather than on the next pulse, so the new
-		// slot positions are known and the slide can start from the exact
+		// slot positions are known and each slide can start from the exact
 		// offset between "where the face was seen" and "where it now lives".
 		Header.layout();
 
-		Map<TabButton, Double> __Offsets = new HashMap<>();
-		for (Map.Entry<TabButton, Double> __Entry : __VisualX.entrySet())
+		for (Map.Entry<ATabButton, Double> __Entry : __VisualX.entrySet())
 		{
-			TabButton __Face = __Entry.getKey();
+			ATabButton __Face = __Entry.getKey();
 			if (__Face == DraggedFace)
 				continue;
 			double __Offset = __Entry.getValue() - __Face.getLayoutX();
-			if (Math.abs(__Offset) < 0.5)
-			{
-				__Face.setTranslateX(0);
-				continue;
-			}
-			__Offsets.put(__Face, __Offset);
+			// SlideFrom snaps sub-threshold offsets to zero without starting a
+			// timer, so no separate epsilon check is needed here.
+			__Face.SlideFrom(__Offset);
 		}
-		AnimateSlots(__Offsets);
-	}
 
-	/**
-	 * Start the slot slide: every given face is placed at its snapshotted
-	 * visual offset and eased to its layout slot. A new permutation stops and
-	 * replaces the running timeline, so rapid drags never queue sweeps.
-	 *
-	 * @param _Offsets face → starting offset in header pixels; the callers
-	 *                 drop sub-pixel offsets and skip the dragged face, so an
-	 *                 empty map means nothing moves and no timeline starts
-	 */
-	private void AnimateSlots(Map<TabButton, Double> _Offsets)
-	{
-		if (SlideTimeline != null)
-		{
-			SlideTimeline.stop();
-			SlideTimeline = null;
-		}
-		if (_Offsets.isEmpty())
-			return;
-
-		SlideTimeline = new Timeline();
-		for (Map.Entry<TabButton, Double> __Entry : _Offsets.entrySet())
-		{
-			TabButton __Face = __Entry.getKey();
-			__Face.setTranslateX(__Entry.getValue());
-			SlideTimeline.getKeyFrames().add(new KeyFrame(SLOT_SLIDE_DURATION,
-					new KeyValue(__Face.translateXProperty(), 0.0, Interpolator.EASE_BOTH)));
-		}
-		SlideTimeline.playFromStart();
+		// Last, so a listener reading the strip back always sees the completed
+		// permutation: lists, header children and selection index all updated.
+		FireTabOrderChanged(_From, _To);
 	}
 
 	/**
@@ -818,9 +1000,11 @@ public class ATabWidget extends VBox implements IThemeChangeEvent
 		if (_Index < 0 || _Index >= TabButtons.size())
 			throw new IndexOutOfBoundsException("Tab index out of range: " + _Index);
 
-		TabButton __Button = TabButtons.remove(_Index);
+		ATabButton __Button = TabButtons.remove(_Index);
 		Node __RemovedContent = TabContents.remove(_Index);
 		Header.getChildren().remove(__Button);
+		// A face removed mid-slide would keep ticking on a detached node.
+		__Button.StopSlide();
 		// Programmatic close of the face being dragged: drop the gesture so the
 		// ticker does not chase a detached node.
 		if (__Button == DraggedFace)
@@ -868,7 +1052,7 @@ public class ATabWidget extends VBox implements IThemeChangeEvent
 
 	/**
 	 * @return the zero-based index of the currently selected tab, or -1 if
-	 *         nothing is selected
+	 * nothing is selected
 	 */
 	public int GetSelectedIndex()
 	{
@@ -899,7 +1083,7 @@ public class ATabWidget extends VBox implements IThemeChangeEvent
 	 */
 	public void SetTabTitle(int _Index, String _Title)
 	{
-		TabButtons.get(_Index).SetTitle(_Title);
+		TabButtons.get(_Index).setText(_Title);
 	}
 
 	/**
@@ -916,6 +1100,42 @@ public class ATabWidget extends VBox implements IThemeChangeEvent
 	public boolean IsModifiable()
 	{
 		return Modifiable;
+	}
+
+	/**
+	 * Snapshot of the tab contents, in current display order.
+	 * <p>
+	 * The list is a copy, not the live backing list: reordering and closing
+	 * shift the real list underneath (a drag can permute it on any frame), so a
+	 * caller iterating a snapshot cannot trip over a permutation. Indexes taken
+	 * from the snapshot are only valid until the next reorder or close —
+	 * resolve through {@link #IndexOf(Node)} when holding on to a node.
+	 *
+	 * @return an unmodifiable copy of the content nodes, index-aligned with
+	 * {@link #GetTabHeaders()}
+	 */
+	public List<Node> GetTabContents()
+	{
+		return Collections.unmodifiableList(new ArrayList<>(TabContents));
+	}
+
+	/**
+	 * Snapshot of the tab faces — the "headers" of the strip — in current
+	 * display order, index-aligned with {@link #GetTabContents()}. The
+	 * {@code "+"} affix is not a tab and is not included.
+	 * <p>
+	 * Like {@link #GetTabContents()}, this is a copy taken at call time: safe
+	 * to iterate while a drag permutes the strip, but every position taken
+	 * from it goes stale on the next reorder or close, so re-read it instead of
+	 * caching it. The faces themselves are the live nodes — mutate them (title,
+	 * size) rather than replacing them, since the widget indexes its own lists
+	 * by identity.
+	 *
+	 * @return an unmodifiable copy of the tab faces
+	 */
+	public List<ATabButton> GetTabHeaders()
+	{
+		return Collections.unmodifiableList(new ArrayList<>(TabButtons));
 	}
 
 	// ── Tab face sizing ──────────────────────────────────────────────────
@@ -985,7 +1205,7 @@ public class ATabWidget extends VBox implements IThemeChangeEvent
 	 *
 	 * @param _Button the face to configure
 	 */
-	private void ApplyTabSizes(TabButton _Button)
+	private void ApplyTabSizes(ATabButton _Button)
 	{
 		_Button.setMinWidth(TabMinWidth);
 		_Button.setMaxWidth(TabMaxWidth);
@@ -998,7 +1218,7 @@ public class ATabWidget extends VBox implements IThemeChangeEvent
 	 */
 	private void ApplyTabSizes()
 	{
-		for (TabButton __Button : TabButtons)
+		for (ATabButton __Button : TabButtons)
 			ApplyTabSizes(__Button);
 		if (btn_AddTab != null)
 			ApplyTabSizes(btn_AddTab);
@@ -1010,9 +1230,8 @@ public class ATabWidget extends VBox implements IThemeChangeEvent
 	 * Register a selection listener. Held weakly, so a listener that is
 	 * garbage-collected without unsubscribing is pruned on the next fire.
 	 *
-	 * @apiNote Must be called on the FX thread.
-	 *
 	 * @param _Event the listener to notify on tab selection changes
+	 * @apiNote Must be called on the FX thread.
 	 */
 	public void AddSelectionEvent(ISubTabSelectionEvent _Event)
 	{
@@ -1023,9 +1242,8 @@ public class ATabWidget extends VBox implements IThemeChangeEvent
 	 * Register a listener for {@code "+"} clicks. Fired only in modifiable
 	 * mode; respond by calling {@link #AddTab}.
 	 *
-	 * @apiNote Must be called on the FX thread.
-	 *
 	 * @param _Event the listener to notify on new-tab requests
+	 * @apiNote Must be called on the FX thread.
 	 */
 	public void AddNewTabRequestEvent(INewTabRequestEvent _Event)
 	{
@@ -1035,13 +1253,36 @@ public class ATabWidget extends VBox implements IThemeChangeEvent
 	/**
 	 * Register a listener fired after the user closes a tab.
 	 *
-	 * @apiNote Must be called on the FX thread.
-	 *
 	 * @param _Event the listener to notify on tab closes
+	 * @apiNote Must be called on the FX thread.
 	 */
 	public void AddTabCloseEvent(ITabCloseEvent _Event)
 	{
 		TabCloseListeners.add(new WeakReference<>(_Event));
+	}
+
+	/**
+	 * Register a listener fired after the tab order changes, i.e. after a
+	 * drag-reorder permutes the strip. The new order is already in place when
+	 * it fires, so read it back through {@link #GetTabContents()} /
+	 * {@link #GetTabHeaders()} rather than from the event.
+	 * <p>
+	 * Only reorders fire it: {@link #AddTab} reports through its return value
+	 * and a close through {@link ITabCloseEvent}. During one drag the listener
+	 * runs once per slot crossing, so keep the handler cheap and idempotent
+	 * instead of treating each call as a commit point.
+	 * <p>
+	 * Held weakly like the other listeners, so keep a strong reference to the
+	 * listener (typically a field on the owning view) — one reachable only from
+	 * this registration is collected and silently stops firing.
+	 *
+	 * @param _Event the listener to notify on tab order changes
+	 * @apiNote Must be called on the FX thread; the listener is invoked on it
+	 *          too, possibly several times within a single drag.
+	 */
+	public void AddTabOrderChangeEvent(ITabOrderChangeEvent _Event)
+	{
+		OrderChangeListeners.add(new WeakReference<>(_Event));
 	}
 
 	// ── Event broadcast ──────────────────────────────────────────────────
@@ -1103,6 +1344,25 @@ public class ATabWidget extends VBox implements IThemeChangeEvent
 		}
 	}
 
+	/**
+	 * Notify tab-order-changed listeners, pruning dead references inline.
+	 */
+	private void FireTabOrderChanged(int _From, int _To)
+	{
+		int __I = 0;
+		while (__I < OrderChangeListeners.size())
+		{
+			ITabOrderChangeEvent __Event = OrderChangeListeners.get(__I).get();
+			if (__Event != null)
+			{
+				__Event.Event(_From, _To);
+				__I++;
+			}
+			else
+				OrderChangeListeners.remove(__I);
+		}
+	}
+
 	// ── Theme ────────────────────────────────────────────────────────────
 
 	/**
@@ -1128,191 +1388,5 @@ public class ATabWidget extends VBox implements IThemeChangeEvent
 	{
 		getStylesheets().clear();
 		getStylesheets().addAll(ThemeManager.Instance.GetTabButtonStylesheets(TabVariant));
-	}
-
-	// ── Private tab face component ───────────────────────────────────────
-
-	/**
-	 * One tab face of the header row: an {@link HBox} carrying the title
-	 * {@link Label} and — for closable tabs — the {@code ×} close
-	 * {@link ATabButton}. Styled entirely by the cascading tab skin through the
-	 * {@code a-tab-button} style class (background shades, padding, cursor,
-	 * hover/pressed states); the selected, pressed and dragging states are
-	 * custom {@code :selected} / {@code :pressed} / {@code :dragging}
-	 * pseudo-class toggles matching the palette shades (an HBox never enters
-	 * Control's armed state, so pressed is tracked manually), and
-	 * {@code :dragging} — set only by the owning widget's reorder gesture,
-	 * which also raises the face via {@code viewOrder} — outranks the other
-	 * two in the baked stylesheet. The face is focus-traversable and activates
-	 * on primary click or Enter/Space. The close button carries the
-	 * {@code a-tab-close} class (muted normally, primary on hover), is not
-	 * focus-traversable, and consumes its mouse events so pressing it neither
-	 * selects the tab nor starts a drag-reorder.
-	 */
-	private final class TabButton extends HBox
-	{
-		/** The pseudo-class marking the selected (active) tab face */
-		private static final PseudoClass SELECTED = PseudoClass.getPseudoClass("selected");
-		/** The pseudo-class marking a face with a primary button held down on it */
-		private static final PseudoClass PRESSED = PseudoClass.getPseudoClass("pressed");
-		/** The pseudo-class marking the face currently lifted by a drag-reorder */
-		private static final PseudoClass DRAGGING = PseudoClass.getPseudoClass("dragging");
-
-		/** The tab title */
-		private final Label lbl_Title;
-		/** The {@code ×} close face; null when the face is not closable */
-		private ATabButton btn_Close;
-		/** Invoked on primary click or Enter/Space; null until SetOnAction */
-		private Runnable OnActionHandler;
-		/** Invoked when the close button is clicked; null when not closable */
-		private Runnable OnCloseHandler;
-
-		/**
-		 * Create a tab face.
-		 *
-		 * @param _Title    the tab label
-		 * @param _Closable true to include the {@code ×} close button
-		 */
-		TabButton(String _Title, boolean _Closable)
-		{
-			getStyleClass().add("a-tab-button");
-			setSpacing(2);
-			// Keyboard parity with the previous Button-based faces: reachable
-			// via Tab traversal, activated with Enter/Space.
-			setFocusTraversable(true);
-			setOnKeyPressed(__Event ->
-			{
-				if (__Event.getCode() == KeyCode.ENTER || __Event.getCode() == KeyCode.SPACE)
-				{
-					__Event.consume();
-					FireAction();
-				}
-			});
-
-			lbl_Title = new Label(_Title);
-			getChildren().add(lbl_Title);
-
-			if (_Closable)
-			{
-				// ATabButton attaches no stylesheet of its own — this widget's
-				// cascading TabButtonSkin sheet styles it at the strip's
-				// variant; the additional a-tab-close class (with the skin's
-				// compound .a-tab-button.a-tab-close rules) flattens the
-				// Modena chrome.
-				btn_Close = new ATabButton("×");
-				btn_Close.getStyleClass().add("a-tab-close");
-				// The old close face was a non-focusable graphic; keep it out
-				// of Tab traversal so it does not precede real controls.
-				btn_Close.setFocusTraversable(false);
-				// Consume press + click + drag so the close neither selects
-				// the tab nor arms a drag-reorder on the host face (dragged
-				// events are retargeted to the press node, so consuming here
-				// keeps the whole gesture off the face's handlers).
-				btn_Close.setOnMousePressed(MouseEvent::consume);
-				btn_Close.setOnMouseClicked(MouseEvent::consume);
-				btn_Close.setOnMouseDragged(MouseEvent::consume);
-				btn_Close.setOnAction(__Event ->
-				{
-					__Event.consume();
-					if (OnCloseHandler != null)
-						OnCloseHandler.run();
-				});
-				getChildren().add(btn_Close);
-			}
-
-			// Primary click only — secondary/middle clicks must not select.
-			setOnMouseClicked(__Event ->
-			{
-				if (__Event.getButton() == MouseButton.PRIMARY)
-					FireAction();
-			});
-
-			// Manual pressed feedback (filters run before the drag handlers,
-			// which need their own onMousePressed). Pressing the close button
-			// must not light up the face.
-			addEventFilter(MouseEvent.MOUSE_PRESSED, __Event ->
-			{
-				if (__Event.getButton() == MouseButton.PRIMARY && __Event.getTarget() != btn_Close)
-					pseudoClassStateChanged(PRESSED, true);
-			});
-			addEventFilter(MouseEvent.MOUSE_RELEASED, __Event -> pseudoClassStateChanged(PRESSED, false));
-		}
-
-		/**
-		 * Register the activation action (select this tab, or request a new
-		 * one for the {@code "+"} affix).
-		 *
-		 * @param _OnAction invoked on primary click or Enter/Space
-		 */
-		void SetOnAction(Runnable _OnAction)
-		{
-			OnActionHandler = _OnAction;
-		}
-
-		/**
-		 * Register the close action. Ignored on faces created without a
-		 * close button (e.g. the {@code "+"} affix).
-		 *
-		 * @param _OnClose invoked when the user clicks the close button
-		 */
-		void SetOnClose(Runnable _OnClose)
-		{
-			OnCloseHandler = _OnClose;
-		}
-
-		/**
-		 * Mark this face as the selected (active) tab. The {@code :selected}
-		 * pseudo-class drives the brighter selected skin; unselecting
-		 * restores the inactive tab look.
-		 *
-		 * @param _Selected true to select, false to deselect
-		 */
-		void SetSelected(boolean _Selected)
-		{
-			pseudoClassStateChanged(SELECTED, _Selected);
-		}
-
-		/**
-		 * Mark this face as lifted by a drag-reorder. The {@code :dragging}
-		 * pseudo-class drives the raised skin (brighter shade + drop shadow +
-		 * closed-hand cursor) and outranks {@code :selected} / {@code :pressed}
-		 * in the baked stylesheet.
-		 *
-		 * @param _Dragging true while the face follows the pointer
-		 */
-		void SetDragging(boolean _Dragging)
-		{
-			pseudoClassStateChanged(DRAGGING, _Dragging);
-		}
-
-		/**
-		 * Change the tab label.
-		 *
-		 * @param _Title the new label
-		 */
-		void SetTitle(String _Title)
-		{
-			lbl_Title.setText(_Title);
-		}
-
-		/**
-		 * Cap this face's height. Used by the {@link ETabButtonVariant#SMALL}
-		 * variant to force the tab strip shorter than the NORMAL main-tab
-		 * strip; the {@link Label} inside will ellipsize if the text exceeds
-		 * the available height.
-		 *
-		 * @param _MaxHeight the maximum height in pixels
-		 */
-		void SetMaxFaceHeight(double _MaxHeight)
-		{
-			setMaxHeight(_MaxHeight);
-		}
-
-		/** Run the activation action if one is registered. */
-		private void FireAction()
-		{
-			if (OnActionHandler != null)
-				OnActionHandler.run();
-		}
 	}
 }
